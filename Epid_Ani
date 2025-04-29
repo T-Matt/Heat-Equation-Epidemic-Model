@@ -1,0 +1,259 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import geopandas as gpd
+import os
+from tqdm import tqdm
+from matplotlib.animation import FuncAnimation
+
+def create_boundary_masks(grid_height, grid_width, min_lat, max_lat, min_lon, max_lon, 
+                           counties=None, coastline_smooth_sigma=1.5):
+    from rasterio import features
+    from shapely.ops import unary_union
+    from affine import Affine
+    from scipy.ndimage import gaussian_filter
+    import numpy as np
+
+    print("Creating boundary masks...")
+
+    # Grid setup
+    x = np.linspace(min_lon, max_lon, grid_width)
+    y = np.linspace(min_lat, max_lat, grid_height)
+    X, Y = np.meshgrid(x, y)
+
+    county_boundaries_mask = np.zeros((grid_height, grid_width), dtype=bool)
+    coastline_mask = np.zeros((grid_height, grid_width), dtype=bool)
+    land_mask = np.zeros((grid_height, grid_width), dtype=bool)
+
+    if counties is not None:
+        print("Rasterizing California land and county boundaries...")
+
+        land_polygon = unary_union(counties.geometry)
+
+        transform = Affine(
+            (max_lon - min_lon) / grid_width, 0, min_lon,
+            0, (max_lat - min_lat) / grid_height, min_lat
+        )
+
+        land_mask = features.geometry_mask(
+            [(land_polygon, 1)],
+            out_shape=(grid_height, grid_width),
+            transform=transform,
+            invert=True
+        )
+
+        # 🔥 Smooth version for coastline detection (user-controlled smoothness!)
+        land_mask_smooth = gaussian_filter(land_mask.astype(float), sigma=coastline_smooth_sigma)
+
+        # 🔥 Detect coastline (transition zone around 0.5 threshold)
+        coastline_mask = (land_mask_smooth > 0.4) & (land_mask_smooth < 0.6)
+
+        shapes = [(geom.boundary, 1) for geom in counties.geometry if geom is not None]
+        county_boundaries_mask = features.geometry_mask(
+            shapes,
+            out_shape=(grid_height, grid_width),
+            transform=transform,
+            invert=True
+        )
+
+    print("Boundary masks created.")
+    return county_boundaries_mask, coastline_mask, land_mask
+
+
+# Functions
+def initialize_infection(california_cities, min_lat, max_lat, min_lon, max_lon, 
+                         grid_resolution=40, initial_infection_percentage=0.002,
+                         sigma_deg=0.05, land_mask=None):
+    grid_width = int((max_lon - min_lon) * grid_resolution)
+    grid_height = int((max_lat - min_lat) * grid_resolution)
+    x = np.linspace(min_lon, max_lon, grid_width)
+    y = np.linspace(min_lat, max_lat, grid_height)
+    X, Y = np.meshgrid(x, y)
+    u = np.zeros((grid_height, grid_width))
+    
+    for city, data in california_cities.items():
+        lat, lon, pop = data["lat"], data["lon"], data["population"]
+        amplitude = pop * initial_infection_percentage
+        distance_squared = (X - lon)**2 + (Y - lat)**2
+        u += amplitude * np.exp(-distance_squared / (2 * sigma_deg**2))
+    
+    if land_mask is not None:
+        u *= land_mask
+
+    print("Initializing Infection")
+    return u
+
+def solve_heat_equation_step(u, diffusion_coefficient=0.1, dt=0.01, 
+                              coastline_mask=None, land_mask=None):
+    u_new = u.copy()
+    u_new[0, :] = u_new[-1, :] = u_new[:, 0] = u_new[:, -1] = 0
+
+    if land_mask is not None:
+        u_new = np.where(land_mask, u_new, 0)
+
+    laplacian = (
+        u_new[:-2, 1:-1] +
+        u_new[2:, 1:-1] +
+        u_new[1:-1, :-2] +
+        u_new[1:-1, 2:] -
+        4 * u_new[1:-1, 1:-1]
+    )
+
+    u_new[1:-1, 1:-1] += diffusion_coefficient * dt * laplacian
+
+
+    if coastline_mask is not None:
+        u_new[coastline_mask] *= 0.05
+
+    if land_mask is not None:
+        u_new *= land_mask
+
+    return np.maximum(u_new, 0)
+
+def animate_infection(u_initial, california_cities, min_lat, max_lat, min_lon, max_lon,
+                      california_counties=None, coastline_mask=None, land_mask=None,
+                      end_day=30, dt=0.01, interval=100, filename='infection_animation.mp4'):
+    # If output file already exists, remove it
+    if os.path.exists(filename):
+        print(f"Overwriting existing file: {filename}")
+        os.remove(filename)
+    
+    fig = plt.figure(figsize=(12, 10))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.add_feature(cfeature.LAND.with_scale('50m'), facecolor='lightgray')
+    ax.add_feature(cfeature.OCEAN.with_scale('50m'), facecolor='lightblue')
+    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.8)
+    ax.add_feature(cfeature.STATES.with_scale('50m'), edgecolor='black')
+    
+    if california_counties is not None:
+        ax.add_geometries(california_counties.geometry, crs=ccrs.PlateCarree(),
+                          edgecolor='gray', facecolor='none', linewidth=0.5)
+        
+    ax.set_extent([min_lon, max_lon, min_lat, max_lat], crs=ccrs.PlateCarree())
+
+    norm = colors.LogNorm(vmin=1, vmax=10000)
+    infection_plot = ax.imshow(
+        np.where(land_mask, u_initial, np.nan),
+        extent=[min_lon, max_lon, min_lat, max_lat],
+        transform=ccrs.PlateCarree(),
+        origin='lower',
+        cmap='hot', # < COLORMAP
+        norm=norm,
+        alpha=0.7
+    )
+
+    
+    plt.colorbar(infection_plot, ax=ax, label='Infected Individuals')
+
+    for city, data in california_cities.items():
+        ax.plot(data["lon"], data["lat"], 'bo', markersize=6, transform=ccrs.PlateCarree())
+        offset_kwargs = dict(transform=ccrs.PlateCarree(), fontsize=10)
+        if city in ['Oakland', 'Anaheim', 'Los Angeles']:
+            ax.text(data["lon"] + 0.1, data["lat"], city, va='bottom', ha='left', **offset_kwargs)
+        elif city == 'San Diego':
+            ax.text(data["lon"] + 0.1, data["lat"], city, va='bottom', ha='center', **offset_kwargs)
+        else:
+            ax.text(data["lon"] + 0.1, data["lat"], city, va='top', ha='left', **offset_kwargs)
+
+    u = u_initial.copy()
+    steps = int(end_day / dt)
+    frameskip = max(1, steps // 100)
+
+    title = ax.set_title(f"Infection Spread - Day 0", fontsize=16)
+    simulated_day = 0
+
+    def update(frame):
+        nonlocal u, simulated_day
+        for _ in range(frameskip):
+            u = solve_heat_equation_step(u, diffusion_coefficient=0.1, dt=dt,
+                                         coastline_mask=coastline_mask, land_mask=land_mask)
+            simulated_day += dt
+
+        # Update infection map
+        #infection_plot.set_data(u * land_mask)
+        #infection_plot.set_data(np.where(land_mask, u, np.nan))
+        infection_plot.set_data(np.where(land_mask > 0.5, u, np.nan))
+
+
+        day_counter = int(simulated_day)
+        year = 1 + day_counter // 365
+        day_in_year = (day_counter % 365) + 1
+        title.set_text(f"Year {year} - Day {day_in_year}")
+
+        return infection_plot, title
+
+
+    anim = FuncAnimation(fig, update, frames=tqdm(range(100)), interval=interval, blit=False)
+    anim.save(filename, writer='ffmpeg', dpi=150)
+    plt.close()
+
+# Example Usage
+
+# Configure matplotlib for better visualizations
+plt.rcParams['figure.figsize'] = (12, 10)
+plt.rcParams['figure.dpi'] = 200
+
+# Define major California cities with their coordinates and populations
+california_cities = {
+    "Los Angeles": {"lat": 34.0522, "lon": -118.2437, "population": 3980000},
+    "San Diego": {"lat": 32.7157, "lon": -117.1611, "population": 1410000},
+    "San Jose": {"lat": 37.3382, "lon": -121.8863, "population": 1030000},
+    "San Francisco": {"lat": 37.7749, "lon": -122.4194, "population": 875000},
+    "Fresno": {"lat": 36.7378, "lon": -119.7871, "population": 530000},
+    "Sacramento": {"lat": 38.5816, "lon": -121.4944, "population": 510000},
+    "Long Beach": {"lat": 33.7701, "lon": -118.1937, "population": 466000},
+    "Oakland": {"lat": 37.8044, "lon": -122.2711, "population": 433000},
+    "Bakersfield": {"lat": 35.3733, "lon": -119.0187, "population": 380000},
+    "Anaheim": {"lat": 33.8366, "lon": -117.9143, "population": 350000}
+}
+
+# Calculate the bounding box for California
+lats = [city["lat"] for city in california_cities.values()]
+lons = [city["lon"] for city in california_cities.values()]
+min_lat, max_lat = min(lats) - 1.5, max(lats) + 1.5
+min_lon, max_lon = min(lons) - 1.5, max(lons) + 1.5
+
+counties = gpd.read_file('/Users/matt/Documents/MT Data Projects/Epid/CountyLines/tl_2023_us_county.shp')
+california_counties = counties[counties['STATEFP'] == '06']
+
+# Define your california_cities, min_lat, max_lat, min_lon, max_lon, and county masks before this point
+
+grid_resolution = 20
+initial_infection_percentage = 0.005
+sigma_deg = 0.05
+end_day = 1*364
+dt = 0.01
+
+grid_width = int((max_lon - min_lon) * grid_resolution)
+grid_height = int((max_lat - min_lat) * grid_resolution)
+
+county_boundaries_mask, coastline_mask, land_mask = create_boundary_masks(
+    grid_height, grid_width,
+    min_lat, max_lat, min_lon, max_lon,
+    counties=california_counties,
+    coastline_smooth_sigma=2.0   # <-- you control the "softness"!
+)
+
+u_initial = initialize_infection(
+    california_cities, min_lat, max_lat, min_lon, max_lon,
+    grid_resolution=grid_resolution,
+    initial_infection_percentage=initial_infection_percentage,
+    sigma_deg=sigma_deg,
+    land_mask=land_mask
+)
+
+animate_infection(
+    u_initial=u_initial,
+    california_cities=california_cities,
+    min_lat=min_lat, max_lat=max_lat,
+    min_lon=min_lon, max_lon=max_lon,
+    california_counties=california_counties,
+    coastline_mask=coastline_mask,
+    land_mask=land_mask,
+    end_day=end_day,
+    dt=dt,
+    interval=100,
+    filename='Infectious_Spread_AnimatedModel.mp4'
+)
